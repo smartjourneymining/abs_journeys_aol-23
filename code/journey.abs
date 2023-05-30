@@ -1,0 +1,538 @@
+
+// A workflow simulator.
+//
+// The basic idea, in one sequence diagram:
+// 1. The customer asks the WorkflowProvider which actions are
+//    available. Depending on the workflow provider's strategy, this could be
+//    all actions or only a subset.
+//
+// 2. The customer decides whether to perform a controlled or uncontrolled
+//    action.  (Note that "controlled", "uncontrolled" are from the point of
+//    view of the company; uncontrolled actions are undertaken by the
+//    customer.)
+//
+// 3. If the customer performs an uncontrollable action, it informs the
+//    company about the action taken and its new state.
+//
+// 4. If the customer decides to let the company decide the new action:
+//    - The company asks the WorkflowProvider about available controllable
+//      actions, and chooses one.
+//    - The company decides on an action, and informs the customer about the
+//      customer's new state.
+
+module Journeys;
+
+/*
+              ┌─┐                                                            ,.-^^-._
+              ║"│                                                           |-.____.-|
+              └┬┘                                                           |        |
+              ┌┼┐                                                           |        |
+               │                          ┌───────┐                         |        |
+              ┌┴┐                         │Company│                         '-.____.-'
+           Customer                       └───────┘                     WorkflowProvider
+              │                          current state                         │
+              │ ───────────────────────────────────────────────────────────────>
+              │                               │                                │
+              │          available controlled and uncontrolled actions         │
+              │ <───────────────────────────────────────────────────────────────
+              │                               │                                │
+              │                               │                                │
+╔══════╤══════╪═══════════════════════════════╪════════════════════════════════╪══════════════════╗
+║ ALT  │  Customer chooses uncontrolled action│                                │                  ║
+╟──────┘      │                               │                                │                  ║
+║             │ uncontrolled action, new state│                                │                  ║
+║             │ ──────────────────────────────>                                │                  ║
+║             │                               │                                │                  ║
+║             │                               │  ╔═════════════════════════════╧═══╗              ║
+║             │                               │  ║"Company notes customer action, ░║              ║
+║             │                               │  ║new state"                       ║              ║
+╠═════════════╪═══════════════════════════════╪═══════════════════════════════════════════════════╣
+║ [Customer lets Company choose]              │                                │                  ║
+║             │        current state         ┌┴┐                               │                  ║
+║             │ ────────────────────────────>│ │                               │                  ║
+║             │                              │ │                               │                  ║
+║             │                              │ │        customer state        ┌┴┐                 ║
+║             │                              │ │ ────────────────────────────>│ │                 ║
+║             │                              │ │                              └┬┘                 ║
+║             │                              │ │ available controlled actions  │                  ║
+║             │                              │ │ <─────────────────────────────│                  ║
+║             │                              │ │                               │                  ║
+║             │                              │ │  ╔════════════════════════╗   │                  ║
+║             │                              │ │  ║Company chooses action ░║   │                  ║
+║             │                              └┬┘  ╚════════════════════════╝   │                  ║
+║             │           new state           │                                │                  ║
+║             │ <──────────────────────────────                                │                  ║
+╚═════════════╪═══════════════════════════════╪════════════════════════════════╪══════════════════╝
+
+*/
+
+// ==============================
+//
+// Data types, database queries
+
+data WorkflowTask = WorkflowTask(String origin_state, // state of the customer before this action
+                                 String target_state, // state of the customer after this action
+                                 String action,       // name of the action
+                                 String controllable, // "True" if action is controllable by the company, "False" otherwise
+                                                      // -- note that these are strings, not ABS Bool values
+                                 Float gas            // Cost measure of performing this action
+                                 );
+
+data Event = Event(Int event_id, String event_action, String event_timestamp);
+
+data StrategyEntry = StrategyEntry(String strategy_state, String strategy_action);
+
+def WorkflowEvent event_from_action(Int customer_id, String state, String timestamp, WorkflowTask task) =
+    WorkflowEvent(customer_id, timestamp, state, action(task), target_state(task), controllable(task), gas(task));
+data WorkflowEvent = WorkflowEvent ([HTTPName: "id"] Int,
+                                    [HTTPName: "timestamp"] String,
+                                    [HTTPName: "current_state"] String,
+                                    [HTTPName: "action"] String,
+                                    [HTTPName: "next_state"] String,
+                                    [HTTPName: "controllable"] String,
+                                    [HTTPName: "cost"] Float);
+
+
+def List<WorkflowTask> workflow_uppaal()
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              "SELECT start, target, action, controllable, gas FROM workflow_uppaal");
+
+def List<WorkflowTask> workflow_simulation()
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              "SELECT start, target, action, controllable, gas FROM workflow_simulation");
+
+def List<Event> events()
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              `SELECT id, name, timestamp FROM events ORDER BY id, timestamp`);
+
+def List<Int> event_ids()
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              `SELECT DISTINCT id FROM events ORDER BY id, timestamp`);
+
+def List<Event> events_for_id(Int id)
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              `SELECT id, name, timestamp FROM events WHERE id = ? ORDER BY id, timestamp`, id);
+
+def List<String> strategy_names()
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              `SELECT DISTINCT strategy_name FROM strategies`);
+
+def List<StrategyEntry> strategy(String strategy_name)
+    = builtin(sqlite3,
+              "../data/journeys.sqlite",
+              `SELECT state, action FROM strategies WHERE strategy_name = ?`, strategy_name);
+
+
+def List<Event> first_n(Int n, List<Event> events) = when n > 0 then Cons(head(events), first_n(n-1, tail(events))) else Nil;
+
+// ==============================
+//
+// Available workflow tasks, separated into controllable (by the controller)
+// and uncontrollable (instigated by the customer).
+data WorkflowTasks = WorkflowTasks(List<WorkflowTask> controllable_tasks, List<WorkflowTask> uncontrollable_tasks);
+
+data WorkflowType = Uppaal | Simulation;
+
+interface WorkflowDriver {
+    WorkflowType getWorkflowType();
+    WorkflowTasks available_tasks(Int customer_id, String state);
+}
+
+// This class implements a maximally permissive workflow driver.  It offers
+// all controllable and uncontrollable actions available in a given state and
+// lets the client choose which action to take.
+class WorkflowDriver(WorkflowType workflow_type) implements WorkflowDriver {
+    Map<String, List<WorkflowTask>> actions_in_state = map[];
+    {
+        List<WorkflowTask> tasks = case workflow_type {
+            Uppaal => workflow_uppaal()
+            Simulation => workflow_simulation()
+        };
+        foreach (task in tasks) {
+            actions_in_state =
+                let List<WorkflowTask> tasks = lookupDefault(actions_in_state, origin_state(task), Nil)
+                in put(actions_in_state, origin_state(task), Cons(task, tasks));
+        }
+    }
+
+    WorkflowType getWorkflowType() { return workflow_type; }
+
+    WorkflowTasks available_tasks(Int customer_id, String state) {
+        return
+            let List<WorkflowTask> all_tasks = lookupDefault(actions_in_state, state, Nil)
+            in WorkflowTasks(filter((WorkflowTask t) => controllable(t) == "True")(all_tasks),
+                             filter((WorkflowTask t) => controllable(t) == "False")(all_tasks));
+    }
+}
+
+// This class implements a workflow driver that replays UPPAAL strategies, as
+// given by the files `../data/non_det_strategy.csv` and
+// `../data/refined_strategy.csv`.  Such strategies specify which action to
+// take in a given state.  In case there is no entry for a given state in the
+// strategy, we offer all controllable actions.  We always offer all
+// uncontrollable actions, since the client is always free to choose those.
+//
+// See the query in `strategy_names` for a list of strategies; currently we
+// have "non_det" and "refined".
+class StrategyWorkflowDriver(String strategy_name, WorkflowType workflow_type) implements WorkflowDriver {
+    Map<String, List<WorkflowTask>> actions_in_state = map[];
+    Map<String, List<String>> actions_for_strategy = map[];
+
+    {
+        assert(contains(set(strategy_names()), strategy_name));
+        List<WorkflowTask> tasks = case workflow_type {
+            Uppaal => workflow_uppaal()
+            Simulation => workflow_simulation()
+        };
+        foreach (task in tasks) {
+            actions_in_state =
+                let List<WorkflowTask> tasks = lookupDefault(actions_in_state, origin_state(task), Nil)
+                in put(actions_in_state, origin_state(task), Cons(task, tasks));
+        }
+        foreach (strategy_entry in strategy(strategy_name)) {
+            actions_for_strategy =
+                let List<String> actions = lookupDefault(actions_for_strategy, strategy_state(strategy_entry), Nil)
+                in put(actions_for_strategy, strategy_state(strategy_entry), Cons(strategy_action(strategy_entry), actions));
+        }
+    }
+
+    WorkflowType getWorkflowType() { return workflow_type; }
+
+    // Return all controllable tasks in the strategy for the given state, plus
+    // all uncontrollable tasks in the given state
+    // TODO (rudi): this should be a database query instead of ABS code
+    WorkflowTasks available_tasks(Int customer_id, String state) {
+        List<WorkflowTask> all_tasks = lookupDefault(actions_in_state, state, Nil);
+        Set<String> actions_for_strategy = set(lookupDefault(actions_for_strategy, state, Nil));
+        List<WorkflowTask> controllable_tasks = filter((WorkflowTask t) => controllable(t) == "True")(all_tasks);
+        List<WorkflowTask> strategy_tasks = filter((WorkflowTask t) => contains(actions_for_strategy, action(t)))(controllable_tasks);
+        return WorkflowTasks(strategy_tasks, filter((WorkflowTask t) => controllable(t) == "False")(all_tasks));
+    }
+}
+
+
+// ==============================
+//
+// The company.  Gets notified by customers about their uncontrolled actions
+// and consequent new state, and provides new state to customers that want to
+// have a controlled action performed.
+interface Company {
+    // Sends (uncontrolled) action and state that the customer decided to do.
+    Unit notifyUncontrolledAction(Int customer_id, String uncontrolled_action, String new_state);
+    // Ask the company to perform their favorite controlled action for the
+    // given customer and state, returning the chosen action, which contains
+    // the new state of the customer.  In case the company cannot perform an
+    // action, returns the empty string.
+    Maybe<WorkflowTask> performControlledAction(Int customer_id, String current_state);
+}
+
+// The default company.  Outsources decisions on available (controlled)
+// actions to the workflow driver provided.  In case of a nondeterministic
+// workflow driver, chooses among the available actions randomly.
+class Company(WorkflowDriver workflow_driver) implements Company {
+
+    Unit notifyUncontrolledAction(Int customer_id, String uncontrolled_action, String new_state) {
+        skip;
+    }
+
+    Maybe<WorkflowTask> performControlledAction(Int customer_id, String current_state) {
+        Maybe<WorkflowTask> result = Nothing;
+        WorkflowTasks all_tasks = await workflow_driver!available_tasks(customer_id, current_state);
+        List<WorkflowTask> controllable_tasks = controllable_tasks(all_tasks);
+        // The customer is only supposed to ask for an action if there's at
+        // least one available; otherwise, it's supposed to terminate
+        if (controllable_tasks != Nil) {
+            result = Just(nth(controllable_tasks, random(length(controllable_tasks))));
+        }
+        return result;
+    }
+}
+
+// ==============================
+//
+// The customer interface and implementations.
+interface Customer {
+    Int getId();
+    WorkflowType getWorkflowType();
+    Int getNumberOfSteps();
+    String getEndState();
+    Float getAccumulatedGas();
+    Int getUncontrolledProbability();
+}
+
+// Customer that performs an uncontrolled action with the given prability if
+// given the choice.  If only controlled or uncontrolled actions are possible,
+// does those.
+// 0..totally obedient customer
+// 100..maximally uncontrolled customer
+class ParametricCustomer(Int customer_id, WorkflowDriver driver, Company company,
+                         Int uncontrolled_probability /* 0..100 */ )
+    implements Customer
+{
+    Bool finished = False;
+    String current_state = "start";
+    Int n_steps = 0;
+    Float accumulated_gas = 0.0;
+
+    Unit run() {
+        while (!finished) {
+            WorkflowTasks all_possible_tasks = await driver!available_tasks(customer_id, current_state);
+            if (uncontrollable_tasks(all_possible_tasks) != Nil
+                && controllable_tasks(all_possible_tasks) != Nil)
+            {
+                // Choose with the given probability whether to perform an
+                // uncontrollable or controllable action.
+                if (random(100) < uncontrolled_probability) {
+                    this.performUncontrollableAction(uncontrollable_tasks(all_possible_tasks));
+                } else {
+                    this.offerControllableAction();
+                }
+            } else if (uncontrollable_tasks(all_possible_tasks) != Nil) {
+                // Only uncontrollable actions available
+                this.performUncontrollableAction(uncontrollable_tasks(all_possible_tasks));
+            } else if (controllable_tasks(all_possible_tasks) != Nil) {
+                // Only controllable actions available
+                this.offerControllableAction();
+            } else {
+                // No action available: Customer reached an end state
+                finished = True;
+            }
+        }
+    }
+
+    Unit performUncontrollableAction(List<WorkflowTask> uncontrollable_tasks) {
+        WorkflowTask the_task = nth(uncontrollable_tasks, random(length(uncontrollable_tasks)));
+        await company!notifyUncontrolledAction(customer_id, action(the_task), target_state(the_task));
+        current_state = target_state(the_task);
+        accumulated_gas = accumulated_gas + gas(the_task);
+        n_steps = n_steps + 1;
+    }
+
+    Unit offerControllableAction() {
+        Maybe<WorkflowTask> action = await company!performControlledAction(customer_id, current_state);
+        switch (action) {
+            Just(the_task) => {
+                current_state = target_state(the_task);
+                accumulated_gas = accumulated_gas + gas(the_task);
+                n_steps = n_steps + 1;
+            }
+            Nothing => finished = True;
+        }
+    }
+
+    Int getId() { return customer_id; }
+    WorkflowType getWorkflowType() {
+        WorkflowType result = await driver!getWorkflowType();
+        return result;
+    }
+    Int getNumberOfSteps() { await finished; return n_steps; }
+    String getEndState() { await finished; return current_state; }
+    Float getAccumulatedGas() { await finished; return accumulated_gas; }
+    Int getUncontrolledProbability() { return uncontrolled_probability; }
+}
+
+// Helper class for creating customers and collecting results
+interface MainBlockUtil {
+    List<Customer> create_customers(Int n_customers, WorkflowDriver driver, Company company, Int cooperativeness);
+    Map<String, Triple<Int, Int, Float>> printCustomersAsCsvAndCollectInMap(List<Customer> customers, String filename);
+}
+
+class MainBlockUtil implements MainBlockUtil {
+
+    List<Customer> create_customers(Int n_customers, WorkflowDriver driver, Company company, Int cooperativeness) {
+        List<Customer> result = Nil;
+        Int customer_id = 0;
+        while (customer_id < n_customers) {
+            customer_id = customer_id + 1;
+            Customer c = new ParametricCustomer(customer_id, driver, company, cooperativeness);
+            result = Cons(c, result);
+        }
+        return result;
+    }
+
+    Map<String, Triple<Int, Int, Float>> printCustomersAsCsvAndCollectInMap(List<Customer> customers, String filename) {
+        Map<String, Triple<Int, Int, Float>> result = map[];
+
+        println(`===== $filename$ =====`);
+        println("Customer_id,WorkflowType,UncontrolledProbability,EndState,TraceLength,Gas");
+        foreach (c, i in customers) {
+            String end_state = await c!getEndState();
+            Int n_steps = await c!getNumberOfSteps();
+            Float accumulated_gas = await c!getAccumulatedGas();
+            Int id = await c!getId();
+            Int uncontrolled_probability = await c!getUncontrolledProbability();
+            WorkflowType workflow_type = await c!getWorkflowType();
+            println(`$id$,"$workflow_type$",$uncontrolled_probability$,"$end_state$",$n_steps$,$accumulated_gas$`);
+            result
+                = let Triple<Int, Int, Float> current_entry = lookupDefault(result, end_state, Triple(0, 0, 0.0))
+                in put(result, end_state,
+                       Triple(fstT(current_entry) + 1,
+                              sndT(current_entry) + n_steps,
+                              trdT(current_entry) + accumulated_gas));
+        }
+        return result;
+    }
+}
+
+// ==============================
+//
+// Main block.  Things kick off here.
+
+{
+    MainBlockUtil util = new MainBlockUtil();
+    Int n_customers_per_run = 1000;
+
+    // UPPAAL state machine: create a driver for each strategy, a company with each driver
+    WorkflowDriver non_det_uppaal_driver = new StrategyWorkflowDriver("non_det", Uppaal);
+    WorkflowDriver refined_uppaal_driver = new StrategyWorkflowDriver("refined", Uppaal);
+    WorkflowDriver no_strategy_uppaal_driver = new WorkflowDriver(Uppaal);
+    Company non_det_uppaal_company = new Company(non_det_uppaal_driver);
+    Company refined_uppaal_company = new Company(refined_uppaal_driver);
+    Company no_strategy_uppaal_company = new Company(no_strategy_uppaal_driver);
+
+    // Simulation state machine: create a driver for each strategy, a company with each driver
+    WorkflowDriver non_det_simulation_driver = new StrategyWorkflowDriver("non_det", Simulation);
+    WorkflowDriver refined_simulation_driver = new StrategyWorkflowDriver("refined", Simulation);
+    WorkflowDriver no_strategy_simulation_driver = new WorkflowDriver(Simulation);
+    Company non_det_simulation_company = new Company(non_det_simulation_driver);
+    Company refined_simulation_company = new Company(refined_simulation_driver);
+    Company no_strategy_simulation_company = new Company(no_strategy_simulation_driver);
+
+    // Start Simulation state machine simulations
+    List<Customer> prob_100_simulation_nondet =
+        await util!create_customers(n_customers_per_run, non_det_simulation_driver, non_det_simulation_company, 0);
+    List<Customer> prob_100_simulation_refined =
+        await util!create_customers(n_customers_per_run, refined_simulation_driver, refined_simulation_company, 0);
+    List<Customer> prob_100_simulation_no_strategy =
+        await util!create_customers(n_customers_per_run, no_strategy_simulation_driver, no_strategy_simulation_company, 0);
+
+    List<Customer> prob_90_simulation_nondet =
+        await util!create_customers(n_customers_per_run, non_det_simulation_driver, non_det_simulation_company, 10);
+    List<Customer> prob_90_simulation_refined =
+        await util!create_customers(n_customers_per_run, refined_simulation_driver, refined_simulation_company, 10);
+    List<Customer> prob_90_simulation_no_strategy =
+        await util!create_customers(n_customers_per_run, no_strategy_simulation_driver, no_strategy_simulation_company, 10);
+
+    List<Customer> prob_80_simulation_nondet =
+        await util!create_customers(n_customers_per_run, non_det_simulation_driver, non_det_simulation_company, 20);
+    List<Customer> prob_80_simulation_refined =
+        await util!create_customers(n_customers_per_run, refined_simulation_driver, refined_simulation_company, 15);
+    List<Customer> prob_80_simulation_no_strategy =
+        await util!create_customers(n_customers_per_run, no_strategy_simulation_driver, no_strategy_simulation_company, 20);
+
+    List<Customer> prob_70_simulation_nondet =
+        await util!create_customers(n_customers_per_run, non_det_simulation_driver, non_det_simulation_company, 30);
+    List<Customer> prob_70_simulation_refined =
+        await util!create_customers(n_customers_per_run, refined_simulation_driver, refined_simulation_company, 30);
+    List<Customer> prob_70_simulation_no_strategy =
+        await util!create_customers(n_customers_per_run, no_strategy_simulation_driver, no_strategy_simulation_company, 30);
+        
+    List<Customer> prob_60_simulation_nondet =
+        await util!create_customers(n_customers_per_run, non_det_simulation_driver, non_det_simulation_company, 40);
+    List<Customer> prob_60_simulation_refined =
+        await util!create_customers(n_customers_per_run, refined_simulation_driver, refined_simulation_company, 40);
+    List<Customer> prob_60_simulation_no_strategy =
+        await util!create_customers(n_customers_per_run, no_strategy_simulation_driver, no_strategy_simulation_company, 40);
+
+    // End states of SIMULATION customers.
+    // map is end state |-> (count, sum of path lengths, sum of gas).
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_100_simulation_nondet =
+        await util!printCustomersAsCsvAndCollectInMap(prob_100_simulation_nondet, "prob_100_simulation_nondeterministic.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_100_simulation_refined =
+        await util!printCustomersAsCsvAndCollectInMap(prob_100_simulation_refined, "prob_100_simulation_refined.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_100_simulation_no_strategy =
+        await util!printCustomersAsCsvAndCollectInMap(prob_100_simulation_no_strategy, "prob_100_simulation_no_strategy.csv");
+
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_90_simulation_nondet =
+        await util!printCustomersAsCsvAndCollectInMap(prob_90_simulation_nondet, "prob_90_simulation_nondeterministic.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_90_simulation_refined =
+        await util!printCustomersAsCsvAndCollectInMap(prob_90_simulation_refined, "prob_90_simulation_refined.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_90_simulation_no_strategy =
+        await util!printCustomersAsCsvAndCollectInMap(prob_90_simulation_no_strategy, "prob_90_simulation_no_strategy.csv");
+
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_80_simulation_nondet =
+        await util!printCustomersAsCsvAndCollectInMap(prob_80_simulation_nondet, "prob_80_simulation_nondeterministic.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_80_simulation_refined =
+        await util!printCustomersAsCsvAndCollectInMap(prob_80_simulation_refined, "prob_80_simulation_refined.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_80_simulation_no_strategy =
+        await util!printCustomersAsCsvAndCollectInMap(prob_80_simulation_no_strategy, "prob_80_simulation_no_strategy.csv");
+
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_70_simulation_nondet =
+        await util!printCustomersAsCsvAndCollectInMap(prob_70_simulation_nondet, "prob_70_simulation_nondeterministic.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_70_simulation_refined =
+        await util!printCustomersAsCsvAndCollectInMap(prob_70_simulation_refined, "prob_70_simulation_refined.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_70_simulation_no_strategy =
+        await util!printCustomersAsCsvAndCollectInMap(prob_70_simulation_no_strategy, "prob_70_simulation_no_strategy.csv");
+
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_60_simulation_nondet =
+        await util!printCustomersAsCsvAndCollectInMap(prob_60_simulation_nondet, "prob_60_simulation_nondeterministic.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_60_simulation_refined =
+        await util!printCustomersAsCsvAndCollectInMap(prob_60_simulation_refined, "prob_60_simulation_refined.csv");
+    Map<String, Triple<Int, Int, Float>> end_state_for_prob_60_simulation_no_strategy =
+        await util!printCustomersAsCsvAndCollectInMap(prob_60_simulation_no_strategy, "prob_60_simulation_no_strategy.csv");
+
+
+    // Results, in CSV
+    println("===== summary.csv =====");
+    println("WorkflowType,DisobedienceProbability,Strategy,EndState,Count,MeanTraceLength,MeanGas");
+
+    // Simulation end results
+    // print uncontrolled strategy
+    foreach (triple in entries(end_state_for_prob_100_simulation_nondet)) {
+        println(`"Simulation",100,"Nondeterministic","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_100_simulation_refined)) {
+        println(`"Simulation",100,"Refined","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_100_simulation_no_strategy)) {
+        println(`"Simulation",100,"No_Strategy","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+
+foreach (triple in entries(end_state_for_prob_90_simulation_nondet)) {
+        println(`"Simulation",90,"Nondeterministic","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_90_simulation_refined)) {
+        println(`"Simulation",90,"Refined","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_90_simulation_no_strategy)) {
+        println(`"Simulation",90,"No_Strategy","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+
+    foreach (triple in entries(end_state_for_prob_80_simulation_nondet)) {
+        println(`"Simulation",80,"Nondeterministic","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_80_simulation_refined)) {
+        println(`"Simulation",15,"Refined","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_80_simulation_no_strategy)) {
+        println(`"Simulation",80,"No_Strategy","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+
+        foreach (triple in entries(end_state_for_prob_70_simulation_nondet)) {
+        println(`"Simulation",70,"Nondeterministic","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_70_simulation_refined)) {
+        println(`"Simulation",70,"Refined","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_70_simulation_no_strategy)) {
+        println(`"Simulation",70,"No_Strategy","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+
+
+    foreach (triple in entries(end_state_for_prob_60_simulation_nondet)) {
+        println(`"Simulation",60,"Nondeterministic","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_60_simulation_refined)) {
+        println(`"Simulation",60,"Refined","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+    foreach (triple in entries(end_state_for_prob_60_simulation_no_strategy)) {
+        println(`"Simulation",60,"No_Strategy","$fst(triple)$",$fstT(snd(triple))$,$float(sndT(snd(triple))/fstT(snd(triple)))$,$trdT(snd(triple))/float(fstT(snd(triple)))$`);
+    }
+
+}
